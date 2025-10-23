@@ -1,8 +1,15 @@
-.venv/
+# Generated alert logs
+alerts_session_*.csv
+
+# Python cache and environment files
 __pycache__/
+.venv/
+venv/
 *.pyc
-.ipynb_checkpoints/
-.DS_Store
-*.log
-# Streamlit related
+
+# IDE-specific files (if you're using VS Code or other IDEs)
+.vscode/
+.idea/
+
+# Streamlit specific (if any local cache)
 .streamlit/

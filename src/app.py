@@ -41,7 +41,7 @@ except Exception as e:
     st.stop()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s') # Changed to DEBUG
 logger = logging.getLogger(__name__)
 
 # Page configuration
@@ -207,7 +207,7 @@ try:
 except Exception as e:
     st.error(f"Application failed to initialize: {e}")
     st.stop()
-
+logger.info(f"Loaded feature names from data: {feature_names.tolist()}")
 
 def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter="tcp or udp"):
     """
@@ -222,10 +222,11 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
     worker_flows = defaultdict(list)
     feature_index_map = {name: i for i, name in enumerate(feature_names_list)}
 
-    # BUG FIX: The packet processing function must also gather the flags and direction
+    # The packet processing function must also gather the flags and direction
     # for the analysis function to work correctly.
     def process_packet_local(packet):
         if IP in packet:
+            logger.debug(f"Captured IP packet: {packet[IP].src} -> {packet[IP].dst}, Proto: {packet[IP].proto}")
             src_ip, dst_ip = packet[IP].src, packet[IP].dst
             sport, dport = (0, 0)
             tcp_flags = {}
@@ -249,16 +250,22 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
                 'flags': tcp_flags
             }
             worker_flows[flow_key].append(packet_info)
+        else:
+            logger.debug(f"Captured non-IP packet: {packet.summary()}")
 
     def analyze_and_send_flows_local():
         if not worker_flows:
+            logger.debug("No flows to analyze yet.")
             return
 
         current_flows = dict(worker_flows)
         worker_flows.clear()
 
+        logger.info(f"Analyzing {len(current_flows)} flows.")
+
         for key, packets in current_flows.items():
             if len(packets) < 2:
+                logger.debug(f"Flow {key} has only {len(packets)} packets, skipping for now.")
                 continue
 
             feature_vector = np.zeros(len(feature_names_list))
@@ -700,6 +707,8 @@ if app_mode == "Offline Simulation":
                     stat2.metric("Confidence", utils.format_confidence(confidence))
                     stat3.metric("Time", timestamp)
 
+
+
     # Display detailed results if available
     if 'prediction_result' in st.session_state:
         result = st.session_state.prediction_result
@@ -863,6 +872,7 @@ if app_mode == "Offline Simulation":
             else:
                 st.info("SHAP explanation is only available for detected attacks.")
 
+
 elif app_mode == "Live Monitoring":
     st.header(f"Live Network Monitoring on `{st.session_state.get('interface', 'None')}`")
     col1, col2 = st.columns(2)
@@ -874,6 +884,8 @@ elif app_mode == "Live Monitoring":
                 interface = st.session_state.get('interface')
                 if interface:
                     packet_filter = st.session_state.get('packet_filter', 'tcp or udp')
+                    # Clear the log every time you start
+                    st.session_state.alerts_log = ""
                     success, message = safe_start_monitoring(interface, feature_names, packet_filter)
                     if success:
                         st.success(f"Live capture started on interface '{interface}'!")
@@ -895,42 +907,74 @@ elif app_mode == "Live Monitoring":
 
     st.markdown("---")
 
-    # Real-time Dashboard
+    # --- Initialize session state variables ONCE ---
+    if 'alerts_log' not in st.session_state:
+        st.session_state.alerts_log = ""
+    if 'worker_error_count' not in st.session_state:
+        st.session_state.worker_error_count = 0
+    if 'max_worker_errors' not in st.session_state:
+        st.session_state.max_worker_errors = config.MAX_WORKER_ERRORS
+
+    # --- Real-time Dashboard (You can uncomment this later) ---
+    st.header("📊 Real-Time Dashboard")
+    # ... (your dashboard plots would go here) ...
 
     st.markdown("---")
     st.header("Live Alert Log")
-    log_placeholder = st.empty()
-    if 'alerts_log' not in st.session_state:
-        st.session_state.alerts_log = ""
 
-    with log_placeholder.container():
-        if st.session_state.capture_process and st.session_state.capture_process.is_alive():
-            st.info("Monitoring... New alerts will appear below.")
+    # 1. Define the text_area directly. Do NOT use st.empty() or .container()
+    # Its value is permanently bound to the session_state variable.
+    st.text_area(
+        "Alerts",
+        value=st.session_state.alerts_log,  # Always display the current content
+        height=300,
+        key="live_alerts_textarea_display"  # A single, consistent key
+    )
 
-            from queue import Empty
+    # 2. Run the monitoring/update logic
+    if st.session_state.capture_process and st.session_state.capture_process.is_alive():
+        st.info("Monitoring... New alerts will appear below.")
 
-            max_polls = 10
-            for _ in range(max_polls):
+        if 'queue_check_count' not in st.session_state:
+            st.session_state.queue_check_count = 0
+        st.session_state.queue_check_count += 1
+        logger.debug(f"UI Check #{st.session_state.queue_check_count}: Checking alert queue...")
+
+        from queue import Empty
+
+        max_polls = 10  # Process up to 10 items per rerun
+        items_processed_this_run = 0
+
+        # 3. Poll the queue and update the st.session_state.alerts_log string
+        for _ in range(max_polls):
+            try:
+                logger.debug("Attempting queue.get_nowait()...")
+                feature_vector, flow_info = st.session_state.alert_queue.get_nowait()
+                items_processed_this_run += 1
+                logger.info(f"UI received item from queue: Flow {flow_info}")
+
+                # Handle error messages from the worker process
+                if isinstance(feature_vector, str) and feature_vector == "__ERROR__":
+                    st.session_state.worker_error_count += 1
+                    error_msg = f"Worker process error ({st.session_state.worker_error_count}/{st.session_state.max_worker_errors}): {flow_info}"
+                    st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_msg}\n" + st.session_state.alerts_log
+                    st.error(error_msg)
+                    logger.error(error_msg)
+                    if st.session_state.worker_error_count >= st.session_state.max_worker_errors:
+                        st.error("Too many worker errors. Stopping monitoring automatically.")
+                        safe_stop_monitoring()
+                        break
+                    continue
+
+                # Process the feature vector (prediction)
                 try:
-                    feature_vector, flow_info = st.session_state.alert_queue.get_nowait()
-
-                    # Handle error messages from the worker process
-                    if isinstance(feature_vector, str) and feature_vector == "__ERROR__":
-                        st.session_state.worker_error_count += 1
-                        st.error(
-                            f"Worker process error ({st.session_state.worker_error_count}/{st.session_state.max_worker_errors}): {flow_info}")
-
-                        if st.session_state.worker_error_count >= st.session_state.max_worker_errors:
-                            st.error("Too many worker errors. Stopping monitoring automatically.")
-                            safe_stop_monitoring()
-                            break
-                        continue
-
-                    # Process the feature vector
                     scaled_features = scaler.transform(feature_vector.reshape(1, -1))
                     reshaped_features = utils.safe_reshape_for_model(scaled_features, model.input_shape)
                     prediction = model.predict(reshaped_features, verbose=0)
                     class_name, confidence = utils.validate_model_prediction(prediction, label_encoder)
+
+                    logger.info(
+                        f"UI prediction for flow {flow_info}: Class={class_name}, Conf={confidence * 100:.2f}%")
 
                     confidence_percentage = confidence * 100
                     if class_name != 'BENIGN' and confidence_percentage >= confidence_threshold:
@@ -938,23 +982,38 @@ elif app_mode == "Live Monitoring":
                         timestamp = datetime.now()
                         st.session_state.alerts_log = f"`{timestamp.strftime('%H:%M:%S')}` - {alert_message}\n" + st.session_state.alerts_log
                         save_alert_to_csv(class_name, confidence, flow_info, timestamp)
+                        logger.warning(f"ALERT generated: {alert_message}")
                     elif class_name != 'BENIGN' and confidence_percentage < confidence_threshold:
                         low_conf_message = f"⚠️ Low confidence detection: {class_name} ({utils.format_confidence(confidence)}) on {flow_info} (below {confidence_threshold}% threshold)"
                         st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {low_conf_message}\n" + st.session_state.alerts_log
+                        logger.info(low_conf_message)
+                    else:
+                        logger.info(f"Flow {flow_info} classified as BENIGN.")
 
-                except Empty:
-                    break
                 except Exception as e:
                     error_message = f"Error processing flow {flow_info}: {e}"
                     st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_message}\n" + st.session_state.alerts_log
-                    break
+                    logger.error(error_message)
 
-            # Moved the code display outside the loop to prevent
-            # unnecessary UI redraws and potential flickering.
-            st.code(st.session_state.alerts_log, language="log")
-        else:
-            st.info("Monitoring is stopped.")
-            st.code(st.session_state.alerts_log, language="log")
+            except Empty:
+                logger.debug("Queue is empty.")
+                break  # No more items in the queue, stop polling for this run
+            except Exception as e:
+                error_message = f"Error reading from alert queue: {e}"
+                logger.error(f"Error reading from alert queue: {e}")
+                st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_message}\n" + st.session_state.alerts_log
+                break
+
+        logger.debug(f"UI processed {items_processed_this_run} items this run.")
+
+        # 4. Schedule a rerun to check the queue again
+        time.sleep(config.PROCESSING_DELAY)
+        st.rerun()
+
+    else:  # If monitoring is stopped
+        st.info("Monitoring is stopped.")
+        # The text_area widget above will automatically display the final
+        # value of st.session_state.alerts_log.
 
 # Footer
 st.markdown("---")

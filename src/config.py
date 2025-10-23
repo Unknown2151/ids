@@ -2,8 +2,8 @@ import os
 import psutil
 
 # Model and Data Paths
-MODEL_PATH = 'saved_model/cnn_lstm_ids_model_resampled.h5'
-DATA_PATH = 'data/'
+MODEL_PATH = 'src/saved_model/cnn_lstm_ids_model_resampled.h5'
+DATA_PATH = 'src/data/'
 
 # Streamlit Configuration
 PAGE_TITLE = "XAI-IDS"
