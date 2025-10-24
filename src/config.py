@@ -17,7 +17,9 @@ SHAP_BACKGROUND_SAMPLES = 50
 
 # Real-time Configuration
 DEFAULT_INTERFACE = 'Wi-Fi'
-PROCESSING_DELAY = 1  # seconds
+PROCESSING_DELAY = 0.2  # seconds
+MAX_WORKER_ERRORS = 5 # Max errors before worker stops
+MAX_QUEUE_PROCESS_PER_CYCLE = 50 # Max items to process from queue per Streamlit rerun cycle (adjust as needed)
 
 # UI Configuration
 ALERT_COLORS = {

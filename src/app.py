@@ -34,11 +34,9 @@ try:
 except ImportError:
     SCAPY_AVAILABLE = False
     st.error("Scapy is not installed. Please install it with: pip install scapy")
-    st.stop()
 except Exception as e:
     SCAPY_AVAILABLE = False
     st.error(f"Error importing Scapy: {e}")
-    st.stop()
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s') # Changed to DEBUG
@@ -209,6 +207,7 @@ except Exception as e:
     st.stop()
 logger.info(f"Loaded feature names from data: {feature_names.tolist()}")
 
+
 def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter="tcp or udp"):
     """
     This function runs in a separate process to sniff packets and extract features.
@@ -218,6 +217,14 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
     import numpy as np
     from scapy.all import sniff
     from scapy.layers.inet import IP, TCP, UDP
+    import logging
+
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - WORKER - %(levelname)s - %(message)s')
+    worker_logger = logging.getLogger(__name__)
+
+    worker_logger.info(f"Worker process started for interface: {interface}")
+    worker_logger.info(f"Packet filter: {packet_filter}")
+    worker_logger.info(f"Scapy available: {SCAPY_AVAILABLE}")
 
     worker_flows = defaultdict(list)
     feature_index_map = {name: i for i, name in enumerate(feature_names_list)}
@@ -226,7 +233,7 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
     # for the analysis function to work correctly.
     def process_packet_local(packet):
         if IP in packet:
-            logger.debug(f"Captured IP packet: {packet[IP].src} -> {packet[IP].dst}, Proto: {packet[IP].proto}")
+            worker_logger.debug(f"Captured IP packet: {packet[IP].src} -> {packet[IP].dst}, Proto: {packet[IP].proto}")
             src_ip, dst_ip = packet[IP].src, packet[IP].dst
             sport, dport = (0, 0)
             tcp_flags = {}
@@ -251,21 +258,21 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
             }
             worker_flows[flow_key].append(packet_info)
         else:
-            logger.debug(f"Captured non-IP packet: {packet.summary()}")
+            worker_logger.debug(f"Captured non-IP packet: {packet.summary()}")
 
     def analyze_and_send_flows_local():
         if not worker_flows:
-            logger.debug("No flows to analyze yet.")
+            worker_logger.debug("No flows to analyze yet.")
             return
 
         current_flows = dict(worker_flows)
         worker_flows.clear()
 
-        logger.info(f"Analyzing {len(current_flows)} flows.")
+        worker_logger.info(f"Analyzing {len(current_flows)} flows.")
 
         for key, packets in current_flows.items():
             if len(packets) < 2:
-                logger.debug(f"Flow {key} has only {len(packets)} packets, skipping for now.")
+                worker_logger.debug(f"Flow {key} has only {len(packets)} packets, skipping for now.")
                 continue
 
             feature_vector = np.zeros(len(feature_names_list))
@@ -306,12 +313,15 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
                 (ip1, port1), (ip2, port2) = key
                 flow_info = f"Flow between {ip1}:{port1} and {ip2}:{port2}"
 
+                # Send REAL features to queue
                 queue.put((feature_vector.astype(float), flow_info))
+                worker_logger.info(f"Sent REAL flow analysis: {flow_info}")
+
             except (KeyError, IndexError) as e:
-                logger.warning(f"Skipping flow due to missing feature key: {e}")
+                worker_logger.warning(f"Skipping flow due to missing feature key: {e}")
                 continue
             except Exception as e:
-                logger.error(f"Error processing a flow: {e}")
+                worker_logger.error(f"Error processing a flow: {e}")
                 continue
 
     def analysis_loop_local():
@@ -323,14 +333,22 @@ def scapy_worker(interface, queue, stop_event, feature_names_list, packet_filter
     analysis_thread = threading.Thread(target=analysis_loop_local, daemon=True)
     analysis_thread.start()
 
+    # --- REAL SNIFFING BLOCK ---
     try:
-        while not stop_event.is_set():
-            sniff(iface=interface, prn=process_packet_local, store=False, timeout=2,
-                  filter=packet_filter, stop_filter=lambda p: stop_event.is_set())
+        worker_logger.info(f"🎯 Starting REAL Scapy sniff on interface {interface} with filter '{packet_filter}'...")
+        sniff(iface=interface,
+              prn=process_packet_local,
+              store=False,
+              filter=packet_filter,
+              stop_filter=lambda p: stop_event.is_set())
     except Exception as e:
-        queue.put(("__ERROR__", str(e)))
+        worker_logger.error(f"Scapy sniff error: {e}", exc_info=True)
+        queue.put(("__ERROR__", f"Scapy sniff failed: {e}"))
+    finally:
+        worker_logger.info("Scapy sniff finished.")
+        stop_event.set()  # Ensure analysis thread also stops
 
-    analysis_thread.join(timeout=1)
+    analysis_thread.join(timeout=1)  # Ensure the analysis thread has a chance to finish
 
 
 # Initialize session state
@@ -351,15 +369,36 @@ if 'max_worker_errors' not in st.session_state:
 
 # Process cleanup function
 def cleanup_background_processes():
-    """Clean up any running background processes"""
+    """Proper process cleanup with timeout and kill fallback"""
     if st.session_state.capture_process and st.session_state.capture_process.is_alive():
-        logger.info("Cleaning up background processes...")
-        if st.session_state.stop_event:
-            st.session_state.stop_event.set()
-        st.session_state.capture_process.join(timeout=5)
-        if st.session_state.capture_process.is_alive():
-            st.session_state.capture_process.terminate()
-        st.session_state.capture_process = None
+        try:
+            if st.session_state.stop_event:
+                st.session_state.stop_event.set()
+
+            # Graceful termination with timeout
+            st.session_state.capture_process.join(timeout=5)
+
+            if st.session_state.capture_process.is_alive():
+                logger.warning("Process didn't terminate gracefully, forcing kill")
+                st.session_state.capture_process.kill()
+                st.session_state.capture_process.join(timeout=2)
+
+            # Clean up multiprocessing resources
+            if st.session_state.alert_queue:
+                try:
+                    while not st.session_state.alert_queue.empty():
+                        st.session_state.alert_queue.get_nowait()
+                except:
+                    pass
+                st.session_state.alert_queue.close()
+                st.session_state.alert_queue.join_thread()
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            st.session_state.capture_process = None
+            st.session_state.alert_queue = None
+            st.session_state.stop_event = None
 
 def safe_start_monitoring(interface, feature_names, packet_filter):
     """Safely start monitoring with proper error handling and cleanup"""
@@ -545,7 +584,7 @@ with st.sidebar:
 
         with col2:
             st.markdown("### Model Settings")
-            confidence_threshold = st.slider("Confidence threshold (%)", 50, 99, 85)
+            confidence_threshold = st.slider("Confidence threshold (%)", 50, 99, 75)
             enable_shap = st.checkbox("Enable SHAP explanations", value=True)
 
     # Packet Filter Settings (for Live Monitoring)
@@ -758,8 +797,12 @@ if app_mode == "Offline Simulation":
                         try:
                             explainer = get_shap_explainer(model, background_sample)
                             shap_values = explainer.shap_values(result['reshaped_data_2d'])
-                            predicted_class_idx = list(label_encoder.classes_).index(predicted_class)
-
+                            try:
+                                predicted_class_idx = list(label_encoder.classes_).index(predicted_class)
+                            except ValueError:
+                                logger.warning(
+                                    f"Predicted class {predicted_class} not in label encoder, using 0 as fallback")
+                                predicted_class_idx = 0
 
                             if isinstance(shap_values, list):
                                 # Case 1: Standard multi-output (list of arrays)
@@ -790,7 +833,6 @@ if app_mode == "Offline Simulation":
                             st.markdown("---")
                             st.markdown("### Model Prediction Interpretation")
 
-                            # BUG FIX: Replaced the undefined 'shap_flat' variable with the correct
                             # one, 'shap_values_for_class', to prevent a NameError.
                             feature_importance = np.abs(shap_values_for_class)
                             top_features_idx = np.argsort(feature_importance)[-10:][::-1]
@@ -859,9 +901,6 @@ if app_mode == "Offline Simulation":
                                     f"- **Negative Evidence:** {negative_contrib:.4f} (features supporting normal traffic)")
                                 st.markdown('</div>', unsafe_allow_html=True)
 
-                                # Attack-specific interpretation (unchanged)
-                                # ...
-
                             st.success("SHAP explanation generated successfully!")
 
                         except Exception as e:
@@ -875,6 +914,26 @@ if app_mode == "Offline Simulation":
 
 elif app_mode == "Live Monitoring":
     st.header(f"Live Network Monitoring on `{st.session_state.get('interface', 'None')}`")
+
+    # Initialize session state variables
+    if 'alerts_log' not in st.session_state:
+        st.session_state.alerts_log = "Monitoring log will appear here...\n"
+    if 'worker_error_count' not in st.session_state:
+        st.session_state.worker_error_count = 0
+    if 'max_worker_errors' not in st.session_state:
+        st.session_state.max_worker_errors = 5
+    if 'queue_check_count' not in st.session_state:
+        st.session_state.queue_check_count = 0
+    if 'confidence_threshold' not in st.session_state:
+        st.session_state.confidence_threshold = 85
+    if 'last_alert_features' not in st.session_state:
+        st.session_state.last_alert_features = None
+    if 'last_alert_class' not in st.session_state:
+        st.session_state.last_alert_class = None
+    if 'last_alert_flow_info' not in st.session_state:
+        st.session_state.last_alert_flow_info = None
+
+    # Control buttons
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🟢 Start Monitoring", use_container_width=True):
@@ -884,11 +943,18 @@ elif app_mode == "Live Monitoring":
                 interface = st.session_state.get('interface')
                 if interface:
                     packet_filter = st.session_state.get('packet_filter', 'tcp or udp')
-                    # Clear the log every time you start
-                    st.session_state.alerts_log = ""
+                    # Clear log and reset count when starting
+                    st.session_state.alerts_log = "🟢 REAL Monitoring started...\n"
+                    st.session_state.alerts_log += "🎯 Capturing REAL network packets...\n"
+                    st.session_state.worker_error_count = 0
+                    st.session_state.queue_check_count = 0
+                    st.session_state.last_alert_features = None
+                    st.session_state.last_alert_class = None
+                    st.session_state.last_alert_flow_info = None
                     success, message = safe_start_monitoring(interface, feature_names, packet_filter)
                     if success:
-                        st.success(f"Live capture started on interface '{interface}'!")
+                        st.success(f"🎯 REAL packet capture started on interface '{interface}'!")
+                        st.rerun()
                     else:
                         st.error(f"Failed to start monitoring: {message}")
                         st.info(
@@ -897,123 +963,388 @@ elif app_mode == "Live Monitoring":
                     st.error("Please select a valid network interface.")
             else:
                 st.warning("Monitoring is already in progress.")
+
     with col2:
         if st.button("🔴 Stop Monitoring", use_container_width=True):
             success, message = safe_stop_monitoring()
             if success:
+                st.session_state.alerts_log = f"🔴 Monitoring stopped.\n{st.session_state.alerts_log}"
                 st.success("Live capture stopped.")
+                st.rerun()
             else:
                 st.error(f"Error stopping monitoring: {message}")
 
     st.markdown("---")
 
-    # --- Initialize session state variables ONCE ---
-    if 'alerts_log' not in st.session_state:
-        st.session_state.alerts_log = ""
-    if 'worker_error_count' not in st.session_state:
-        st.session_state.worker_error_count = 0
-    if 'max_worker_errors' not in st.session_state:
-        st.session_state.max_worker_errors = config.MAX_WORKER_ERRORS
-
-    # --- Real-time Dashboard (You can uncomment this later) ---
+    # Status display
     st.header("📊 Real-Time Dashboard")
-    # ... (your dashboard plots would go here) ...
+
+    status_placeholder = st.empty()
+    if st.session_state.capture_process and st.session_state.capture_process.is_alive():
+        status_placeholder.success("🟢 REAL MONITORING ACTIVE - Capturing live network traffic")
+    else:
+        status_placeholder.info("🔴 MONITORING STOPPED - Click 'Start Monitoring' to begin real packet capture")
 
     st.markdown("---")
+
+    # Live Alert Log Section
     st.header("Live Alert Log")
 
-    # 1. Define the text_area directly. Do NOT use st.empty() or .container()
-    # Its value is permanently bound to the session_state variable.
-    st.text_area(
-        "Alerts",
-        value=st.session_state.alerts_log,  # Always display the current content
-        height=300,
-        key="live_alerts_textarea_display"  # A single, consistent key
-    )
-
-    # 2. Run the monitoring/update logic
+    # Status message
     if st.session_state.capture_process and st.session_state.capture_process.is_alive():
-        st.info("Monitoring... New alerts will appear below.")
+        st.info("🎯 Capturing REAL network packets... Alerts will appear below in real-time.")
+    else:
+        st.info("Monitoring is stopped. Start monitoring to capture real network traffic.")
 
-        if 'queue_check_count' not in st.session_state:
-            st.session_state.queue_check_count = 0
+    # Create an empty placeholder for the alert log display
+    alert_log_display_placeholder = st.empty()
+
+    # Debug information
+    with st.expander("Debug Information"):
+        st.write(f"Alerts log length: {len(st.session_state.alerts_log)}")
+        st.write(
+            f"Capture process alive: {st.session_state.capture_process and st.session_state.capture_process.is_alive()}")
+        if st.session_state.alert_queue:
+            st.write(f"Queue size: {st.session_state.alert_queue.qsize()}")
+        st.write(f"Worker errors: {st.session_state.worker_error_count}")
+        st.write(f"UI Check Count: {st.session_state.queue_check_count}")
+        st.write(f"Last Alert Class: {st.session_state.last_alert_class}")
+
+    # --- SHAP Visualization Section ---
+    if st.session_state.capture_process and st.session_state.capture_process.is_alive():
+        # Create expander for SHAP visualizations
+        with st.expander("🎯 Live SHAP Explanations", expanded=True):
+            if (st.session_state.last_alert_features is not None and
+                    st.session_state.last_alert_class is not None and
+                    st.session_state.last_alert_flow_info is not None):
+
+                st.success(f"**Last Alert Analysis: {st.session_state.last_alert_class}**")
+                st.write(f"**Flow:** {st.session_state.last_alert_flow_info}")
+
+                # Create tabs for different SHAP views
+                shap_tab1, shap_tab2, shap_tab3 = st.tabs(["Waterfall Plot", "Feature Importance", "Detailed Analysis"])
+
+                with shap_tab1:
+                    try:
+                        # Generate SHAP plot
+                        explainer = get_shap_explainer(model, background_sample)
+                        shap_values = explainer.shap_values(st.session_state.last_alert_features)
+
+                        predicted_class_idx = list(label_encoder.classes_).index(st.session_state.last_alert_class)
+
+                        if isinstance(shap_values, list):
+                            shap_values_for_class = shap_values[predicted_class_idx][0]
+                            base_value = explainer.expected_value[predicted_class_idx]
+                        elif shap_values.ndim == 3:
+                            shap_values_for_class = shap_values[0, :, predicted_class_idx]
+                            base_value = explainer.expected_value[predicted_class_idx]
+                        else:
+                            shap_values_for_class = shap_values[0]
+                            base_value = explainer.expected_value
+
+                        explanation = shap.Explanation(
+                            values=shap_values_for_class,
+                            base_values=base_value,
+                            data=st.session_state.last_alert_features[0],
+                            feature_names=utils.format_feature_names(feature_names)
+                        )
+
+                        # Create waterfall plot
+                        st.subheader("SHAP Waterfall Plot")
+                        fig, ax = plt.subplots(figsize=(12, 8))
+                        shap.plots.waterfall(explanation, max_display=15, show=False)
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.clf()
+
+                    except Exception as e:
+                        st.error(f"Could not generate SHAP visualization: {e}")
+
+                with shap_tab2:
+                    try:
+                        explainer = get_shap_explainer(model, background_sample)
+                        shap_values = explainer.shap_values(st.session_state.last_alert_features)
+
+                        predicted_class_idx = list(label_encoder.classes_).index(st.session_state.last_alert_class)
+
+                        if isinstance(shap_values, list):
+                            shap_values_for_class = shap_values[predicted_class_idx][0]
+                        elif shap_values.ndim == 3:
+                            shap_values_for_class = shap_values[0, :, predicted_class_idx]
+                        else:
+                            shap_values_for_class = shap_values[0]
+
+                        # Create feature importance bar plot
+                        feature_importance = np.abs(shap_values_for_class)
+                        top_features_idx = np.argsort(feature_importance)[-10:][::-1]  # Top 10 features
+
+                        top_features_names = [utils.format_feature_names(feature_names)[i] for i in top_features_idx]
+                        top_features_importance = [feature_importance[i] for i in top_features_idx]
+                        top_features_contrib = [shap_values_for_class[i] for i in top_features_idx]
+
+                        # Create bar plot
+                        colors = ['red' if x > 0 else 'blue' for x in top_features_contrib]
+
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        bars = ax.barh(top_features_names, top_features_importance, color=colors, alpha=0.7)
+                        ax.set_xlabel('Feature Importance (Absolute SHAP Value)')
+                        ax.set_title('Top 10 Most Important Features')
+                        ax.grid(axis='x', alpha=0.3)
+
+                        # Add value labels
+                        for i, (bar, contrib) in enumerate(zip(bars, top_features_contrib)):
+                            ax.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height() / 2,
+                                    f'{contrib:+.4f}', ha='left', va='center', fontsize=9)
+
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.clf()
+
+                    except Exception as e:
+                        st.error(f"Could not generate feature importance plot: {e}")
+
+                with shap_tab3:
+                    try:
+                        explainer = get_shap_explainer(model, background_sample)
+                        shap_values = explainer.shap_values(st.session_state.last_alert_features)
+
+                        predicted_class_idx = list(label_encoder.classes_).index(st.session_state.last_alert_class)
+
+                        if isinstance(shap_values, list):
+                            shap_values_for_class = shap_values[predicted_class_idx][0]
+                            base_value = explainer.expected_value[predicted_class_idx]
+                        elif shap_values.ndim == 3:
+                            shap_values_for_class = shap_values[0, :, predicted_class_idx]
+                            base_value = explainer.expected_value[predicted_class_idx]
+                        else:
+                            shap_values_for_class = shap_values[0]
+                            base_value = explainer.expected_value
+
+                        # Calculate evidence
+                        positive_contrib = np.sum(shap_values_for_class[shap_values_for_class > 0])
+                        negative_contrib = np.sum(shap_values_for_class[shap_values_for_class < 0])
+                        net_evidence = positive_contrib + negative_contrib
+
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Attack Evidence", f"+{positive_contrib:.4f}")
+                        with col2:
+                            st.metric("Normal Evidence", f"{negative_contrib:.4f}")
+                        with col3:
+                            st.metric("Net Evidence", f"{net_evidence:.4f}")
+
+                        # Top contributing features
+                        st.subheader("Top Contributing Features")
+                        feature_importance = np.abs(shap_values_for_class)
+                        top_features_idx = np.argsort(feature_importance)[-8:][::-1]
+
+                        for i, idx in enumerate(top_features_idx):
+                            feature_name = utils.format_feature_names(feature_names)[idx]
+                            contribution = shap_values_for_class[idx]
+                            actual_value = st.session_state.last_alert_features[0][idx]
+
+                            if contribution > 0:
+                                st.error(f"**{i + 1}. {feature_name}**")
+                                st.write(f"   Contribution: **+{contribution:.4f}** (supports attack)")
+                                st.write(f"   Actual Value: {actual_value:.4f}")
+                            else:
+                                st.success(f"**{i + 1}. {feature_name}**")
+                                st.write(f"   Contribution: **{contribution:.4f}** (supports normal)")
+                                st.write(f"   Actual Value: {actual_value:.4f}")
+                            st.write("---")
+
+                    except Exception as e:
+                        st.error(f"Could not generate detailed analysis: {e}")
+            else:
+                st.info("🔍 SHAP explanations will appear here when attacks are detected")
+                st.write("The AI model will show which features contributed to attack detection")
+                st.write("• Red features indicate attack evidence")
+                st.write("• Blue features indicate normal traffic evidence")
+                st.write("• Larger bars indicate stronger influence")
+
+    # --- Queue Processing Logic ---
+    if st.session_state.capture_process and st.session_state.capture_process.is_alive():
         st.session_state.queue_check_count += 1
-        logger.debug(f"UI Check #{st.session_state.queue_check_count}: Checking alert queue...")
+        logger.info(f"UI Check #{st.session_state.queue_check_count}: Processing alert queue...")
 
         from queue import Empty
 
-        max_polls = 10  # Process up to 10 items per rerun
-        items_processed_this_run = 0
+        processed_count = 0
+        new_alerts_detected = False
 
-        # 3. Poll the queue and update the st.session_state.alerts_log string
-        for _ in range(max_polls):
-            try:
-                logger.debug("Attempting queue.get_nowait()...")
-                feature_vector, flow_info = st.session_state.alert_queue.get_nowait()
-                items_processed_this_run += 1
-                logger.info(f"UI received item from queue: Flow {flow_info}")
-
-                # Handle error messages from the worker process
-                if isinstance(feature_vector, str) and feature_vector == "__ERROR__":
-                    st.session_state.worker_error_count += 1
-                    error_msg = f"Worker process error ({st.session_state.worker_error_count}/{st.session_state.max_worker_errors}): {flow_info}"
-                    st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_msg}\n" + st.session_state.alerts_log
-                    st.error(error_msg)
-                    logger.error(error_msg)
-                    if st.session_state.worker_error_count >= st.session_state.max_worker_errors:
-                        st.error("Too many worker errors. Stopping monitoring automatically.")
-                        safe_stop_monitoring()
-                        break
-                    continue
-
-                # Process the feature vector (prediction)
+        try:
+            # Process available items in queue
+            while processed_count < 50:  # Limit processing per cycle
                 try:
-                    scaled_features = scaler.transform(feature_vector.reshape(1, -1))
-                    reshaped_features = utils.safe_reshape_for_model(scaled_features, model.input_shape)
-                    prediction = model.predict(reshaped_features, verbose=0)
-                    class_name, confidence = utils.validate_model_prediction(prediction, label_encoder)
+                    # Get item from queue (non-blocking)
+                    item = st.session_state.alert_queue.get_nowait()
+                    processed_count += 1
 
-                    logger.info(
-                        f"UI prediction for flow {flow_info}: Class={class_name}, Conf={confidence * 100:.2f}%")
+                    # FIXED: Better error checking for queue items
+                    if not isinstance(item, tuple):
+                        logger.warning(f"Unexpected non-tuple item in queue: {type(item)}")
+                        continue
 
-                    confidence_percentage = confidence * 100
-                    if class_name != 'BENIGN' and confidence_percentage >= confidence_threshold:
-                        alert_message = f"🚨 ALERT! Detected {class_name} ({utils.format_confidence(confidence)}) on {flow_info}"
-                        timestamp = datetime.now()
-                        st.session_state.alerts_log = f"`{timestamp.strftime('%H:%M:%S')}` - {alert_message}\n" + st.session_state.alerts_log
-                        save_alert_to_csv(class_name, confidence, flow_info, timestamp)
-                        logger.warning(f"ALERT generated: {alert_message}")
-                    elif class_name != 'BENIGN' and confidence_percentage < confidence_threshold:
-                        low_conf_message = f"⚠️ Low confidence detection: {class_name} ({utils.format_confidence(confidence)}) on {flow_info} (below {confidence_threshold}% threshold)"
-                        st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {low_conf_message}\n" + st.session_state.alerts_log
-                        logger.info(low_conf_message)
+                    # Handle worker errors - FIXED: Check if first element is string "__ERROR__"
+                    if len(item) >= 2 and isinstance(item[0], str) and item[0] == "__ERROR__":
+                        st.session_state.worker_error_count += 1
+                        error_msg = f"Worker process error ({st.session_state.worker_error_count}/{st.session_state.max_worker_errors}): {item[1]}"
+                        st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_msg}\n" + st.session_state.alerts_log
+                        logger.error(error_msg)
+                        new_alerts_detected = True
+
+                        if st.session_state.worker_error_count >= st.session_state.max_worker_errors:
+                            st.error("Too many worker errors. Stopping monitoring automatically.")
+                            safe_stop_monitoring()
+                            st.rerun()
+                        continue
+
+                    # Handle REAL data (feature_vector, flow_info)
+                    if len(item) == 2:
+                        feature_vector, flow_info = item
+
+                        # Ensure feature_vector is the right type and shape
+                        if not isinstance(feature_vector, (np.ndarray, list)):
+                            logger.warning(f"Unexpected feature_vector type: {type(feature_vector)}")
+                            continue
+
+                        # Convert to numpy array if it's a list
+                        if isinstance(feature_vector, list):
+                            feature_vector = np.array(feature_vector)
+
+                        # Ensure it's 1D array for reshaping
+                        if feature_vector.ndim > 1:
+                            feature_vector = feature_vector.flatten()
+
+                        logger.info(f"Processing REAL network flow: {flow_info}")
+
+                        try:
+                            # REAL prediction for actual network data
+                            scaled_features = scaler.transform(feature_vector.reshape(1, -1))
+                            reshaped_features = utils.safe_reshape_for_model(scaled_features, model.input_shape)
+                            prediction = model.predict(reshaped_features, verbose=0)
+                            class_name, confidence = utils.validate_model_prediction(prediction, label_encoder)
+
+                            confidence_percentage = confidence * 100
+                            timestamp = datetime.now().strftime('%H:%M:%S')
+
+                            # Get the confidence_threshold from session_state
+                            current_confidence_threshold = st.session_state.get('confidence_threshold', 85)
+
+                            # Generate appropriate log message
+                            if class_name != 'BENIGN' and confidence_percentage >= current_confidence_threshold:
+                                alert_message = f"🚨 ALERT! Detected {class_name} ({utils.format_confidence(confidence)}) on {flow_info}"
+                                st.session_state.alerts_log = f"`{timestamp}` - {alert_message}\n" + st.session_state.alerts_log
+                                save_alert_to_csv(class_name, confidence, flow_info, datetime.now())
+                                logger.warning(f"REAL ALERT: {alert_message}")
+                                new_alerts_detected = True
+
+                                # Store for SHAP visualization
+                                st.session_state.last_alert_features = scaled_features
+                                st.session_state.last_alert_class = class_name
+                                st.session_state.last_alert_flow_info = flow_info
+
+                                # Add SHAP insights to log
+                                if st.session_state.get('enable_shap', True):
+                                    try:
+                                        explainer = get_shap_explainer(model, background_sample)
+                                        shap_values = explainer.shap_values(scaled_features)
+
+                                        predicted_class_idx = list(label_encoder.classes_).index(class_name)
+
+                                        if isinstance(shap_values, list):
+                                            shap_values_for_class = shap_values[predicted_class_idx][0]
+                                        elif shap_values.ndim == 3:
+                                            shap_values_for_class = shap_values[0, :, predicted_class_idx]
+                                        else:
+                                            shap_values_for_class = shap_values[0]
+
+                                        # Get top 3 features for log
+                                        feature_importance = np.abs(shap_values_for_class)
+                                        top_features_idx = np.argsort(feature_importance)[-3:][::-1]
+
+                                        shap_insights = []
+                                        for idx in top_features_idx:
+                                            feature_name = utils.format_feature_names(feature_names)[idx]
+                                            contribution = shap_values_for_class[idx]
+                                            if contribution > 0:
+                                                shap_insights.append(f"{feature_name}: +{contribution:.3f}")
+                                            else:
+                                                shap_insights.append(f"{feature_name}: {contribution:.3f}")
+
+                                        if shap_insights:
+                                            shap_message = f"📊 Key features: {', '.join(shap_insights)}"
+                                            st.session_state.alerts_log = f"`{timestamp}` - {shap_message}\n" + st.session_state.alerts_log
+
+                                    except Exception as e:
+                                        logger.error(f"SHAP insight generation failed: {e}")
+
+                            elif class_name != 'BENIGN' and confidence_percentage < current_confidence_threshold:
+                                low_conf_message = f"⚠️ Low confidence: {class_name} ({utils.format_confidence(confidence)}) on {flow_info}"
+                                st.session_state.alerts_log = f"`{timestamp}` - {low_conf_message}\n" + st.session_state.alerts_log
+                                logger.info(low_conf_message)
+                                new_alerts_detected = True
+
+                            else:
+                                # Log BENIGN traffic occasionally
+                                if processed_count % 5 == 0:  # Log every 5th benign flow
+                                    benign_message = f"✓ BENIGN traffic: {flow_info}"
+                                    st.session_state.alerts_log = f"`{timestamp}` - {benign_message}\n" + st.session_state.alerts_log
+                                    logger.debug(benign_message)
+
+                        except Exception as e:
+                            error_message = f"Error processing real flow {flow_info}: {e}"
+                            st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_message}\n" + st.session_state.alerts_log
+                            logger.error(f"Prediction error: {e}")
+                            new_alerts_detected = True
+
                     else:
-                        logger.info(f"Flow {flow_info} classified as BENIGN.")
+                        logger.warning(f"Unexpected tuple length in queue: {len(item)}")
 
+                except Empty:
+                    # Queue is empty for now
+                    break
                 except Exception as e:
-                    error_message = f"Error processing flow {flow_info}: {e}"
+                    error_message = f"Error reading from queue: {e}"
+                    logger.error(f"Queue reading error: {e}")
                     st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_message}\n" + st.session_state.alerts_log
-                    logger.error(error_message)
+                    new_alerts_detected = True
+                    break
 
-            except Empty:
-                logger.debug("Queue is empty.")
-                break  # No more items in the queue, stop polling for this run
-            except Exception as e:
-                error_message = f"Error reading from alert queue: {e}"
-                logger.error(f"Error reading from alert queue: {e}")
-                st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - {error_message}\n" + st.session_state.alerts_log
-                break
+            logger.info(f"Processed {processed_count} REAL items from queue")
 
-        logger.debug(f"UI processed {items_processed_this_run} items this run.")
+            # --- RENDER THE ALERT LOG UI ---
+            with alert_log_display_placeholder.container():
+                st.subheader("Network Traffic Alerts")
+                st.code(
+                    st.session_state.alerts_log,
+                    language='text',
+                    line_numbers=False
+                )
 
-        # 4. Schedule a rerun to check the queue again
-        time.sleep(config.PROCESSING_DELAY)
-        st.rerun()
+            # --- RERUN LOGIC ---
+            if processed_count > 0 or new_alerts_detected:
+                logger.debug("New real alerts detected. Forcing immediate UI rerun.")
+                st.rerun()
+            else:
+                time.sleep(config.PROCESSING_DELAY)
+                st.rerun()
 
-    else:  # If monitoring is stopped
-        st.info("Monitoring is stopped.")
-        # The text_area widget above will automatically display the final
-        # value of st.session_state.alerts_log.
+        except Exception as e:
+            logger.error(f"Critical error in main queue processing loop: {e}")
+            st.session_state.alerts_log = f"`{datetime.now().strftime('%H:%M:%S')}` - CRITICAL ERROR: {e}\n" + st.session_state.alerts_log
+            st.error("Monitoring loop encountered a critical error!")
+            st.rerun()
+
+    else:
+        # If monitoring is not active, ensure the code block still displays the current log state
+        with alert_log_display_placeholder.container():
+            st.subheader("Network Traffic Alerts")
+            st.code(
+                st.session_state.alerts_log,
+                language='text',
+                line_numbers=False
+            )
 
 # Footer
 st.markdown("---")
